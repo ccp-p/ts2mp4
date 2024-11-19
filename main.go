@@ -23,6 +23,8 @@ func main() {
     destDir := flag.String("dest", "D:\\download\\dest", "目标文件夹路径")
     install := flag.Bool("install", false, "安装服务")
     remove := flag.Bool("remove", false, "卸载服务")
+    start := flag.Bool("start", false, "启动服务")
+    stop := flag.Bool("stop", false, "停止服务")
     flag.Parse()
 
     if *install {
@@ -40,6 +42,24 @@ func main() {
             log.Fatalf("卸载服务失败: %v", err)
         }
         log.Println("服务卸载成功")
+        return
+    }
+
+    if *start {
+        err := startService("TsToMp4Service")
+        if err != nil {
+            log.Fatalf("启动服务失败: %v", err)
+        }
+        log.Println("服务启动成功")
+        return
+    }
+
+    if *stop {
+        err := stopService("TsToMp4Service")
+        if err != nil {
+            log.Fatalf("停止服务失败: %v", err)
+        }
+        log.Println("服务停止成功")
         return
     }
 
@@ -129,6 +149,7 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, changes c
     const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
     elog, err := eventlog.Open("TsToMp4Service")
     if err != nil {
+        // 如果打开事件日志失败，记录错误并退出
         return false, 1
     }
     defer elog.Close()
@@ -150,6 +171,7 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, changes c
             elog.Warning(1, fmt.Sprintf("收到未处理的指令: %v", c))
         }
     }
+    elog.Info(1, "服务正在停止")
     return false, 0
 }
 
@@ -207,9 +229,10 @@ func convertTsToMp4WithLogging(tsPath string, destDir string, elog *eventlog.Log
     } else {
         elog.Info(1, fmt.Sprintf("转换成功: %s", destPath))
     }
+	os.Remove(tsPath)
 }
 
-// 注册服务
+// 注册服务 services.msc 查看注册的服务 安装还要启用服务
 func installService(name, desc string) error {
     exepath, err := os.Executable()
     if err != nil {
@@ -232,6 +255,7 @@ func installService(name, desc string) error {
     }
     defer s.Close()
 
+    // 确保事件日志的来源名称与服务名称一致
     err = eventlog.InstallAsEventCreate(name, eventlog.Error|eventlog.Warning|eventlog.Info)
     if err != nil {
         s.Delete()
@@ -263,5 +287,62 @@ func removeService(name string) error {
     if err != nil {
         return fmt.Errorf("删除事件日志失败: %s", err)
     }
+    return nil
+}
+
+// 实现启动服务的函数
+func startService(name string) error {
+    m, err := mgr.Connect()
+    if err != nil {
+        return err
+    }
+    defer m.Disconnect()
+
+    s, err := m.OpenService(name)
+    if err != nil {
+        return fmt.Errorf("服务 %s 不存在", name)
+    }
+    defer s.Close()
+
+    err = s.Start()
+    if err != nil {
+        return fmt.Errorf("启动服务失败: %v", err)
+    }
+
+    return nil
+}
+
+// 实现停止服务的函数
+func stopService(name string) error {
+    m, err := mgr.Connect()
+    if err != nil {
+        return err
+    }
+    defer m.Disconnect()
+
+    s, err := m.OpenService(name)
+    if err != nil {
+        return fmt.Errorf("服务 %s 不存在", name)
+    }
+    defer s.Close()
+
+    status, err := s.Control(svc.Stop)
+    if err != nil {
+        return fmt.Errorf("停止服务失败: %v", err)
+    }
+
+    // 等待服务停止
+    timeout := time.Now().Add(20 * time.Second)
+    for status.State != svc.Stopped {
+        if time.Now().After(timeout) {
+            return fmt.Errorf("服务停止超时")
+        }
+        time.Sleep(300 * time.Millisecond)
+        status, err = s.Query()
+        if err != nil {
+            return fmt.Errorf("查询服���状态失败: %v", err)
+        }
+    }
+
     return nil
 }
