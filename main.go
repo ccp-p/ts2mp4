@@ -43,7 +43,7 @@ func main() {
         return
     }
 
-    isIntSess, err := svc.IsWindowsService()
+    isIntSess, err := svc.IsAnInteractiveSession()
     if err != nil {
         log.Fatalf("无法判断是否为交互式会话: %v", err)
     }
@@ -58,50 +58,157 @@ func main() {
         run(*srcDir, *destDir)
     }
 }
+
 func Run(srcDir string, destDir string) {
-	run(srcDir, destDir)
+    run(srcDir, destDir)
 }
 
 // 修改 run 函数，接受 srcDir 和 destDir 参数
 func run(srcDir string, destDir string) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer watcher.Close()
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer watcher.Close()
 
-	// 创建目标目录
-	os.MkdirAll(destDir, os.ModePerm)
+    // 创建目标目录
+    os.MkdirAll(destDir, os.ModePerm)
 
-	err = watcher.Add(srcDir)
-	if err != nil {
-		log.Fatal(err)
-	}
+    err = watcher.Add(srcDir)
+    if err != nil {
+        log.Fatal(err)
+    }
 
-	log.Println("开始监听目录:", srcDir)
+    log.Println("开始监听目录:", srcDir)
 
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				if strings.HasSuffix(event.Name, ".ts") {
-					log.Println("检测到新文件:", event.Name)
-					// 等待2s，确保文件写入完成
-					time.Sleep(2 * time.Second)
-					go convertTsToMp4(event.Name, destDir)
-				}
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Println("错误:", err)
-		}
-	}
+    for {
+        select {
+        case event, ok := <-watcher.Events:
+            if !ok {
+                return
+            }
+            if event.Op&fsnotify.Create == fsnotify.Create {
+                if strings.HasSuffix(event.Name, ".ts") {
+                    log.Println("检测到新文件:", event.Name)
+                    // 等待2s，确保文件写入完成
+                    time.Sleep(2 * time.Second)
+                    go convertTsToMp4(event.Name, destDir)
+                }
+            }
+        case err, ok := <-watcher.Errors:
+            if !ok {
+                return
+            }
+            log.Println("错误:", err)
+        }
+    }
 }
+
+func convertTsToMp4(tsPath string, destDir string) {
+    fileName := filepath.Base(tsPath)
+    mp4Name := strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+    destPath := filepath.Join(destDir, mp4Name)
+
+    cmd := exec.Command("ffmpeg", "-i", tsPath, "-c", "copy", destPath)
+    err := cmd.Run()
+    if err != nil {
+        log.Println("转换失败:", err)
+    } else {
+        log.Println("转换成功:", destPath)
+    }
+}
+
+// 修改 myService 结构体，添加 srcDir 和 destDir 字段
+type myService struct {
+    srcDir  string
+    destDir string
+}
+
+// 修改 Execute 方法，传入 srcDir 和 destDir
+func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+    const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+    elog, err := eventlog.Open("TsToMp4Service")
+    if err != nil {
+        return false, 1
+    }
+    defer elog.Close()
+
+    elog.Info(1, "服务正在启动")
+    changes <- svc.Status{State: svc.StartPending}
+    go runWithLogging(m.srcDir, m.destDir, elog)
+    changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+
+    for c := range r {
+        switch c.Cmd {
+        case svc.Interrogate:
+            changes <- c.CurrentStatus
+        case svc.Stop, svc.Shutdown:
+            elog.Info(1, "服务正在停止")
+            changes <- svc.Status{State: svc.StopPending}
+            return false, 0
+        default:
+            elog.Warning(1, fmt.Sprintf("收到未处理的指令: %v", c))
+        }
+    }
+    return false, 0
+}
+
+func runWithLogging(srcDir string, destDir string, elog *eventlog.Log) {
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        elog.Error(1, fmt.Sprintf("创建文件系统监视器失败: %v", err))
+        return
+    }
+    defer watcher.Close()
+
+    // 创建目标目录
+    os.MkdirAll(destDir, os.ModePerm)
+
+    err = watcher.Add(srcDir)
+    if err != nil {
+        elog.Error(1, fmt.Sprintf("添加监视目录失败: %v", err))
+        return
+    }
+
+    elog.Info(1, fmt.Sprintf("开始监听目录: %s", srcDir))
+
+    for {
+        select {
+        case event, ok := <-watcher.Events:
+            if !ok {
+                return
+            }
+            if event.Op&fsnotify.Create == fsnotify.Create {
+                if strings.HasSuffix(event.Name, ".ts") {
+                    elog.Info(1, fmt.Sprintf("检测到新文件: %s", event.Name))
+                    // 等待2s，确保文件写入完成
+                    time.Sleep(2 * time.Second)
+                    go convertTsToMp4WithLogging(event.Name, destDir, elog)
+                }
+            }
+        case err, ok := <-watcher.Errors:
+            if !ok {
+                return
+            }
+            elog.Error(1, fmt.Sprintf("监视器错误: %v", err))
+        }
+    }
+}
+
+func convertTsToMp4WithLogging(tsPath string, destDir string, elog *eventlog.Log) {
+    fileName := filepath.Base(tsPath)
+    mp4Name := strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+    destPath := filepath.Join(destDir, mp4Name)
+
+    cmd := exec.Command("ffmpeg", "-i", tsPath, "-c", "copy", destPath)
+    err := cmd.Run()
+    if err != nil {
+        elog.Error(1, fmt.Sprintf("转换失败: %v", err))
+    } else {
+        elog.Info(1, fmt.Sprintf("转换成功: %s", destPath))
+    }
+}
+
 // 注册服务
 func installService(name, desc string) error {
     exepath, err := os.Executable()
@@ -157,51 +264,4 @@ func removeService(name string) error {
         return fmt.Errorf("删除事件日志失败: %s", err)
     }
     return nil
-}
-func convertTsToMp4(tsPath string, destDir string) {
-	fileName := filepath.Base(tsPath)
-	mp4Name := strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
-	destPath := filepath.Join(destDir, mp4Name)
-
-	cmd := exec.Command("ffmpeg", "-i", tsPath, "-c", "copy", destPath)
-	err := cmd.Run()
-	if err != nil {
-		log.Println("转换失败:", err)
-	} else {
-		log.Println("转换成功:", destPath)
-		// 删除旧的 .ts 文件
-		err = os.Remove(tsPath)
-		if err != nil {
-			log.Println("删除旧文件失败:", err)
-		} else {
-			log.Println("删除旧文件成功:", tsPath)
-		}
-	}
-}
-
-// 修改 myService 结构体，添加 srcDir 和 destDir 字段
-type myService struct {
-	srcDir  string
-	destDir string
-}
-
-// 修改 Execute 方法，传入 srcDir 和 destDir
-func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
-	go run(m.srcDir, m.destDir)
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
-			return false, 0
-		default:
-			log.Printf("收到未处理的指令: %v", c)
-		}
-	}
-	return false, 0
 }
